@@ -40,7 +40,6 @@ DEFAULT_TIMEOUT=15
 DEFAULT_DESTINATION_FILE='/etc/nftables.conf'
 DEFAULT_SOURCE_FILE='/etc/nftables-candidate.conf'
 DEFAULT_BACKUP_DIR='/etc/nftables'
-DEFAULT_TMP="${DEFAULT_BACKUP_DIR}/nftables.conf.bak"
 umask 077
 
 readonly PROGNAME VERSION RED NC DEFAULT_TIMEOUT DEFAULT_DESTINATION_FILE DEFAULT_SOURCE_FILE
@@ -106,6 +105,7 @@ source_file="${source_file:-$DEFAULT_SOURCE_FILE}"
 destination_file="${destination_file:-$DEFAULT_DESTINATION_FILE}"
 timeout="${timeout:-$DEFAULT_TIMEOUT}"
 backup_dir="${backup_dir:-$DEFAULT_BACKUP_DIR}"
+DEFAULT_TMP="${DEFAULT_BACKUP_DIR}/nftables.conf.bak"
 
 # Change directory to base script directory
 cd "$(dirname "${0}")"
@@ -137,12 +137,14 @@ restore() {
 
     return 0
 }
-
-save() {
-    NOW=$(date +"%Y-%m-%d_%Hh%Mm%Ss")
+mkbackupdir() {
     if [[ ! -d "${backup_dir}" ]]; then
         mkdir 2>/dev/null "${backup_dir}"
     fi
+}
+save() {
+    NOW=$(date +"%Y-%m-%d_%Hh%Mm%Ss")
+    mkbackupdir
     cp "${source_file}" "${backup_dir}/nftables-installed-${NOW}.nft"
     cp "${source_file}" "${destination_file}"
     echo -e "\nConfiguration changed"
@@ -160,6 +162,8 @@ main() {
         echo -e "${RED}E:${NC} cannot read ${destination_file}" >&2
         exit 4
     fi
+
+    mkbackupdir
 
     # Backup current ruleset
     nft list ruleset >"${DEFAULT_TMP}"
