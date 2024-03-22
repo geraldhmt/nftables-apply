@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.  Please see LICENSE.txt at the top level of
+# the source code distribution for details.
+#
+# @package nftables-apply
+# @author <felix.bouynot@setenforce.one>
+# @link https://github.com/fbouynot/scripts/blob/main/nftables-apply
+# @copyright <felix.bouynot@setenforce.one>
+#
+# Free adaptation for nftables of iptables-apply (https://github.com/wertarbyte/iptables/blob/master/iptables-apply)
+#
+# GHT
+## Add backup directory option
+## set umask for better privacy
+
+# -e: When a command fails, bash exits instead of continuing with the rest of the script
+# -u: This will make the script fail, when accessing an unset variable
+# -o pipefail: This will ensure that a pipeline command is treated as failed, even if one command in the pipeline fails
+set -euo pipefail
+
+# Replace the Internal Field Separator ' \n\t' by '\n\t' so you can loop through names with spaces
+IFS=$'\n\t'
+
+# Enable debug mode by running your script as TRACE=1 ./script.sh instead of ./script.sh
+if [[ "${TRACE-0}" == "1" ]]; then
+    set -o xtrace
+fi
+
+# Define constants
+PROGNAME="${0##*/}"
+VERSION='1.2.8'
+RED="$(tput setaf 1)"
+NC="$(tput sgr0)" # No Color
+
+DEFAULT_TIMEOUT=15
+DEFAULT_DESTINATION_FILE='/etc/nftables.conf'
+DEFAULT_SOURCE_FILE='/etc/nftables-candidate.conf'
+DEFAULT_BACKUP_DIR='/etc/nftables'
+DEFAULT_TMP="${DEFAULT_BACKUP_DIR}/nftables.conf.bak"
+umask 077
+
+readonly PROGNAME VERSION RED NC DEFAULT_TIMEOUT DEFAULT_DESTINATION_FILE DEFAULT_SOURCE_FILE
+
+help() {
+    cat <<EOF
+Usage: ${PROGNAME} [-Vh] [ { -s | --source-file } <source-file> ] [ { -d | --destination-file } <destination-file> ] [ { -t | --timeout } <timeout> ]
+-h    --help                                                     Print this message.
+-V    --version                                                  Print the version.
+-s    --source-file        STRING                                The source file for candidate config.           (default: ${DEFAULT_SOURCE_FILE})
+-d    --destination-file   STRING                                The destination file where to write the config. (default: ${DEFAULT_DESTINATION_FILE})
+-t    --timeout            INT                                   The time to wait before rolling back.           (default: ${DEFAULT_TIMEOUT})
+-b    --backup-dir        STRING                                 The destination dir for backup previous valids rules.           (default: ${DEFAULT_BACKUP_DIR})
+EOF
+
+    exit 2
+}
+
+version() {
+    cat <<EOF
+${PROGNAME} version ${VERSION} under GPLv3 licence.
+EOF
+
+    exit 2
+}
+
+# Deal with arguments
+while [[ $# -gt 0 ]]; do
+    key="${1}"
+
+    case $key in
+    -h | --help)
+        help
+        ;;
+    -s | --source-file)
+        export source_file="${2}"
+        shift # consume -s
+        ;;
+    -d | --destination-file)
+        export destination_file="${2}"
+        shift # consume -d
+        ;;
+    -b | --backup-dir)
+        export backup_dir="${2}"
+        shift # consume -b
+        ;;
+    -t | --timeout)
+        export timeout="${2}"
+        shift # consume -t
+        ;;
+    -V | --version)
+        version
+        ;;
+    *)
+        export source_file="${1}"
+        ;;
+    esac
+    shift # consume $1
+done
+
+# Set defaults if no options specified
+source_file="${source_file:-$DEFAULT_SOURCE_FILE}"
+destination_file="${destination_file:-$DEFAULT_DESTINATION_FILE}"
+timeout="${timeout:-$DEFAULT_TIMEOUT}"
+backup_dir="${backup_dir:-$DEFAULT_BACKUP_DIR}"
+
+# Change directory to base script directory
+cd "$(dirname "${0}")"
+
+# Check root permissions
+check_root() {
+    # Check the command is run as root
+    if [ "${EUID}" -ne 0 ]; then
+        echo -e "${RED}E:${NC} please run as root" >&2
+        exit 3
+    fi
+
+    return 0
+}
+
+restore() {
+    nft flush ruleset
+    nft -f "${DEFAULT_TMP}"
+    rm -f "${DEFAULT_TMP}"
+
+    # Start fail2ban
+    if systemctl is-enabled fail2ban >/dev/null 2>&1; then
+        systemctl start fail2ban 2>/dev/null
+    fi
+    # Start sshguard
+    if systemctl is-enabled sshguard >/dev/null 2>&1; then
+        systemctl start sshguard 2>/dev/null
+    fi
+
+    return 0
+}
+
+save() {
+    NOW=$(date +"%Y-%m-%d_%Hh%Mm%Ss")
+    if [[ ! -d "${backup_dir}" ]]; then
+        mkdir 2>/dev/null "${backup_dir}"
+    fi
+    cp "${source_file}" "${backup_dir}/nftables-installed-${NOW}.nft"
+    cp "${source_file}" "${destination_file}"
+    echo -e "\nConfiguration changed"
+
+    return 0
+}
+
+# Main function
+main() {
+    # Check the command is run as root
+    check_root
+
+    # Check if we can read the destination file
+    if [[ ! -r "${destination_file}" ]]; then
+        echo -e "${RED}E:${NC} cannot read ${destination_file}" >&2
+        exit 4
+    fi
+
+    # Backup current ruleset
+    nft list ruleset >"${DEFAULT_TMP}"
+
+    # Check if we can read the source file
+    if [[ ! -r "${source_file}" ]]; then
+        echo -e "${RED}E:${NC} cannot read ${source_file}" >&2
+        exit 5
+    fi
+
+    # Dry run new ruleset, exit if failures
+    nft --check -f "${source_file}" || (echo -e "${RED}E:${NC} Invalid rules, exiting" >&2 && exit 6)
+
+    # Check the candidate configuration starts by flushing ruleset
+    if [[ $(head -n 1 "${source_file}") != "flush ruleset" ]]; then
+        sed -i '1s/^/flush ruleset\n/' "${source_file}"
+    fi
+
+    # Stop fail2ban
+    if systemctl is-active fail2ban >/dev/null 2>&1; then
+        systemctl stop fail2ban 2>/dev/null
+    fi
+    # Stop sshguard
+    if systemctl is-active sshguard >/dev/null 2>&1; then
+        systemctl stop sshguard 2>/dev/null
+    fi
+
+    # Apply new ruleset, rollback if timeout
+    timeout "${timeout}"s nft -f "${source_file}" || (echo -e "${RED}E:${NC} timeout while applying new configuration, rolling back to the previous ruleset" >&2 && restore && exit 7)
+
+    # Ask the user if they can open a new connection
+    # If they can't, rollback
+    # If they can, save
+    echo -n "Can you establish NEW connections to the machine? (y/N) "
+    read -r -n1 -t "${timeout}" answer 2>&1 || :
+    if [[ "${answer}" == "y" ]]; then
+        save
+    else
+        echo -e "\n${RED}E:${NC} rolling back to the previous ruleset" >&2
+        restore
+        exit 8
+    fi
+    rm -f "${DEFAULT_TMP}"
+
+    # Start fail2ban
+    if systemctl is-enabled fail2ban >/dev/null 2>&1; then
+        systemctl start fail2ban 2>/dev/null
+    fi
+    # Start sshguard
+    if systemctl is-enabled sshguard >/dev/null 2>&1; then
+        systemctl start sshguard 2>/dev/null
+    fi
+
+    exit 0
+}
+
+main "$@"
